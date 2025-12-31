@@ -1,4 +1,5 @@
 // server.js
+require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
@@ -7,11 +8,18 @@ const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '2mb' }));
 
+if (!process.env.FIREBASE_KEY) {
+  console.error('❌ FIREBASE_KEY not found in .env');
+  process.exit(1);
+}
+
 let serviceAccount;
 try {
-  serviceAccount = require('./serviceAccountKey.json');
+  serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+
+  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 } catch (err) {
-  console.error('ERROR: serviceAccountKey.json not found!');
+  console.error('❌ Invalid FIREBASE_KEY JSON');
   process.exit(1);
 }
 
