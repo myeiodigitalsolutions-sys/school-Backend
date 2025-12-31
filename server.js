@@ -1,4 +1,4 @@
-require('dotenv').config(); // LOAD .env FIRST
+
 
 const express = require('express');
 const admin = require('firebase-admin');
