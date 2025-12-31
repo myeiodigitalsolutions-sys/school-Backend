@@ -1,4 +1,5 @@
-// server.js
+require('dotenv').config(); // LOAD .env FIRST
+
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
@@ -15,7 +16,6 @@ if (!process.env.FIREBASE_KEY) {
 let serviceAccount;
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-
   serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 } catch (err) {
   console.error('❌ Invalid FIREBASE_KEY JSON');
@@ -31,7 +31,84 @@ const auth = admin.auth();
 
 console.log('Firebase Admin SDK initialized successfully');
 
-// Get current academic year ID from document with isCurrent: true
+/* ===========================
+   FIXED ADMIN CONFIG
+=========================== */
+const ADMIN_EMAIL = 'myeiokln@gmail.com';
+const ADMIN_PASSWORD = 'admin123';
+
+/* ===========================
+   ENSURE ADMIN EXISTS
+=========================== */
+async function ensureAdminExists() {
+  try {
+    let adminUser;
+
+    try {
+      // Check if admin exists in Auth
+      adminUser = await auth.getUserByEmail(ADMIN_EMAIL);
+      console.log('✅ Admin already exists in Auth:', adminUser.uid);
+    } catch (err) {
+      if (err.code !== 'auth/user-not-found') throw err;
+
+      // Create admin in Auth
+      adminUser = await auth.createUser({
+        email: ADMIN_EMAIL,
+        password: ADMIN_PASSWORD,
+      });
+      console.log('🆕 Admin created in Auth:', adminUser.uid);
+    }
+
+    // Apply custom claim
+    const user = await auth.getUser(adminUser.uid);
+    if (!user.customClaims || user.customClaims.admin !== true) {
+      await auth.setCustomUserClaims(adminUser.uid, { admin: true });
+      console.log('🔐 Admin claim applied');
+    }
+
+    // Add admin to Firestore "users" collection with ID "ADMIN"
+    const adminDocRef = db.collection('users').doc('ADMIN');
+    const adminSnap = await adminDocRef.get();
+
+    if (!adminSnap.exists) {
+      await adminDocRef.set({
+        auth_uid: adminUser.uid,
+        created_at: new Date(),
+        dob: '01/01/1990',
+        email: ADMIN_EMAIL,
+        name: 'Admin',
+        role: 'admin',
+        uid: 'ADMIN'
+      });
+      console.log('📁 Admin added to Firestore collection "users" with ID "ADMIN"');
+    } else {
+      console.log('📁 Admin already exists in Firestore collection "users"');
+    }
+
+  } catch (err) {
+    console.error('❌ Failed to ensure admin:', err);
+  }
+}
+
+
+// Call on server start
+ensureAdminExists();
+
+/* ===========================
+   ADMIN VERIFY (CLAIM ONLY)
+=========================== */
+async function verifyAdmin(idToken) {
+  if (!idToken) throw { code: 401, message: 'Missing idToken' };
+
+  const decoded = await auth.verifyIdToken(idToken);
+  if (decoded.admin === true) return decoded;
+
+  throw { code: 403, message: 'Admin access only' };
+}
+
+/* ===========================
+   CURRENT ACADEMIC YEAR
+=========================== */
 async function getCurrentAcademicYearId() {
   const snapshot = await db.collection('academic_years')
     .where('isCurrent', '==', true)
@@ -45,64 +122,9 @@ async function getCurrentAcademicYearId() {
   return snapshot.docs[0].id;
 }
 
-/**
- * Verify caller is global admin from top-level /users collection
- */
-async function verifyAdmin(idToken) {
-  if (!idToken) throw { code: 401, message: 'Missing idToken' };
-
-  const decoded = await auth.verifyIdToken(idToken);
-  const callerAuthUid = decoded.uid;
-
-  // Check custom claim first (optional extra layer)
-  if (decoded.admin === true) {
-    return decoded;
-  }
-
-  // Check in global users collection
-  let adminDoc = null;
-
-  // Try by auth_uid field
-  const q = await db.collection('users')
-    .where('auth_uid', '==', callerAuthUid)
-    .limit(1)
-    .get();
-
-  if (!q.empty) {
-    adminDoc = q.docs[0];
-  }
-
-  // Fallback: try by document ID = auth_uid
-  if (!adminDoc) {
-    const fallbackSnap = await db.collection('users').doc(callerAuthUid).get();
-    if (fallbackSnap.exists) {
-      adminDoc = fallbackSnap;
-    }
-  }
-
-  if (!adminDoc) {
-    throw { code: 403, message: 'Only global admins can perform this action' };
-  }
-
-  const data = adminDoc.data();
-  const role = (data.role || '').toLowerCase();
-  const uidUpper = (data.uid || '').toString().toUpperCase();
-
-  const isAdmin = role.includes('admin') ||
-                  ['ADMIN001', 'SUPERADMIN', 'ROOT'].includes(uidUpper) ||
-                  uidUpper.startsWith('SUPER');
-
-  if (!isAdmin) {
-    throw { code: 403, message: 'Only global admins can perform this action' };
-  }
-
-  return decoded;
-}
-
-/**
- * POST /create-user
- * Creates regular user ONLY in current academic year
- */
+/* ===========================
+   CREATE USER
+=========================== */
 app.post('/create-user', async (req, res) => {
   const { idToken, customUid, email, password, role = 'student', name = '', dob = '' } = req.body || {};
 
@@ -112,11 +134,6 @@ app.post('/create-user', async (req, res) => {
 
   try {
     await verifyAdmin(idToken);
-
-    const uidUpper = customUid.toString().trim().toUpperCase();
-    if (['ADMIN001', 'SUPERADMIN', 'ROOT'].includes(uidUpper) || uidUpper.startsWith('SUPER')) {
-      return res.status(403).json({ error: 'Cannot create reserved UID' });
-    }
 
     const currentYearId = await getCurrentAcademicYearId();
     const targetRef = db
@@ -162,9 +179,9 @@ app.post('/create-user', async (req, res) => {
   }
 });
 
-/**
- * POST /update-user
- */
+/* ===========================
+   UPDATE USER
+=========================== */
 app.post('/update-user', async (req, res) => {
   const { idToken, customUid, email, name, dob } = req.body || {};
 
@@ -194,7 +211,7 @@ app.post('/update-user', async (req, res) => {
     }
 
     const updates = {};
-    let authUpdates = {};
+    const authUpdates = {};
 
     if (email && email !== userData.email) { updates.email = email; authUpdates.email = email; }
     if (name && name !== userData.name) { updates.name = name; }
@@ -220,9 +237,9 @@ app.post('/update-user', async (req, res) => {
   }
 });
 
-/**
- * POST /delete-user
- */
+/* ===========================
+   DELETE USER
+=========================== */
 app.post('/delete-user', async (req, res) => {
   const { idToken, customUid } = req.body;
 
@@ -246,10 +263,6 @@ app.post('/delete-user', async (req, res) => {
     }
 
     const userData = userSnap.data();
-    const uidUpper = (userData.uid || '').toString().toUpperCase();
-    if (['ADMIN001', 'SUPERADMIN', 'ROOT'].includes(uidUpper) || uidUpper.startsWith('SUPER')) {
-      return res.status(403).json({ error: 'Cannot delete global admin' });
-    }
 
     if (userData.auth_uid) {
       try {
@@ -268,10 +281,9 @@ app.post('/delete-user', async (req, res) => {
   }
 });
 
-/**
- * POST /switch-year
- * Global admin only: switches current academic year by setting isCurrent: true on one document
- */
+/* ===========================
+   SWITCH YEAR
+=========================== */
 app.post('/switch-year', async (req, res) => {
   const { idToken, newYearId } = req.body;
 
@@ -284,20 +296,18 @@ app.post('/switch-year', async (req, res) => {
 
     const batch = db.batch();
 
-    // Clear isCurrent from all years
     const allYearsSnap = await db.collection('academic_years').get();
     allYearsSnap.docs.forEach(doc => {
       batch.update(doc.ref, { isCurrent: false });
     });
 
-    // Set new year as current
     const newYearRef = db.collection('academic_years').doc(newYearId);
     const newYearSnap = await newYearRef.get();
     if (!newYearSnap.exists) {
       return res.status(404).json({ error: 'Academic year not found' });
     }
-    batch.update(newYearRef, { isCurrent: true });
 
+    batch.update(newYearRef, { isCurrent: true });
     await batch.commit();
 
     return res.json({ success: true, message: `Current year switched to: ${newYearId}` });
@@ -307,7 +317,9 @@ app.post('/switch-year', async (req, res) => {
   }
 });
 
-// Health check
+/* ===========================
+   HEALTH CHECK
+=========================== */
 app.get('/', (req, res) => {
   res.send('<h1>ADMIN SERVER RUNNING</h1><p>Endpoints: /create-user | /update-user | /delete-user | /switch-year</p>');
 });
